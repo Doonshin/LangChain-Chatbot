@@ -95,50 +95,71 @@ def delete_selected_pdf(selected_pdf):
     return "⚠️ No such file found!", list(uploaded_pdfs.keys())
 
 def chat_with_selected_pdf(message, history, selected_pdf, chat_k):
-    """Handles chatbot interactions with dynamic `k`."""
+    """Streaming-enabled chat function for PDF-based Q&A"""
     try:
         if not selected_pdf or selected_pdf not in uploaded_pdfs:
-            return history + [(message, "⚠️ Please select a valid PDF first.")]
+            yield history + [(message, "⚠️ Please select a valid PDF first.")]
+            return
 
         vector_store = load_faiss_for_pdf(selected_pdf)
         if vector_store is None:
-            return history + [(message, "⚠️ No FAISS index found. Process the PDF first.")]
+            yield history + [(message, "⚠️ No FAISS index found. Process the PDF first.")]
+            return
 
-        retriever = vector_store.as_retriever(search_kwargs={"k": chat_k})  # Dynamic `k`
+        retriever = vector_store.as_retriever(search_kwargs={"k": chat_k})
+        docs = retriever.get_relevant_documents(message)
+
+        context = "\n\n".join([doc.page_content for doc in docs])
 
         llm = ChatOpenAI(model="gpt-4-turbo", streaming=True)
 
-        rag_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=retriever,
-            chain_type="stuff",
-            return_source_documents=False
-        )
+        # Stream response directly from the model
+        history.append((message, ""))  # Start with an empty response
+        response_stream = llm.stream(f"Context:\n{context}\n\nQuestion: {message}\n\nAnswer:")
 
-        response = rag_chain.run(message)
+        for chunk in response_stream:
+            if hasattr(chunk, "content"):  # Extract text from AIMessageChunk
+                history[-1] = (message, history[-1][1] + chunk.content)
+                yield history  # Update the UI in real-time
 
-        history.append((message, response))  # ✅ FIXED: Ensured correct tuple format
-        return history
     except Exception as e:
-        return history + [(message, f"⚠️ Error: {str(e)}")]
+        yield history + [(message, f"⚠️ Error: {str(e)}")]
+
 
 
 def summarize_selected_pdf(selected_pdf, summary_k):
-    """Generates a summary for the selected PDF."""
-    if not selected_pdf or selected_pdf not in uploaded_pdfs:
-        return "⚠️ No FAISS index found for the selected PDF! Process it first."
+    """Generates a summary for the selected PDF with streaming support."""
+    try:
+        if not selected_pdf or selected_pdf not in uploaded_pdfs:
+            yield "⚠️ No FAISS index found for the selected PDF! Process it first."
+            return
 
-    vector_store = load_faiss_for_pdf(selected_pdf)
-    if vector_store is None:
-        return "⚠️ No FAISS index found for the selected PDF! Process it first."
+        vector_store = load_faiss_for_pdf(selected_pdf)
+        if vector_store is None:
+            yield "⚠️ No FAISS index found for the selected PDF! Process it first."
+            return
 
-    retriever = vector_store.as_retriever(search_kwargs={"k": summary_k})
-    llm = ChatOpenAI(model="gpt-4")
+        retriever = vector_store.as_retriever(search_kwargs={"k": summary_k})
+        docs = retriever.get_relevant_documents("Summarize this document")
+        context = "\n\n".join([doc.page_content for doc in docs])
 
-    summarize_chain = load_summarize_chain(llm, chain_type="stuff")
-    summary = summarize_chain.run(retriever.get_relevant_documents("Summarize this document"))
+        llm = ChatOpenAI(model="gpt-4-turbo", streaming=True)
 
-    return summary
+        # Start with an empty summary
+        summary = ""
+        yield summary  # Send an empty initial response
+
+        # Stream the summary generation
+        response_stream = llm.stream(f"Summarize the following document:\n\n{context}")
+
+        for chunk in response_stream:
+            if hasattr(chunk, "content"):  # Extract text from AIMessageChunk
+                summary += chunk.content  # Append streamed content
+                yield summary  # Update the UI in real time
+
+    except Exception as e:
+        yield f"⚠️ Error: {str(e)}"
+
 
 custom_css = """
 body, .gradio-container {
