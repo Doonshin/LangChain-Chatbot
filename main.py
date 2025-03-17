@@ -1,5 +1,6 @@
 import gradio as gr
 import os
+import json
 from langchain_openai import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
 from langchain.chat_models import ChatOpenAI
@@ -16,9 +17,19 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 # Directory to store FAISS indexes
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAISS_INDEX_DIR = os.path.join(BASE_DIR, "faiss_indexes")
+PDF_INDEX_FILE = os.path.join(BASE_DIR, "uploaded_pdfs.json")
 
-# Dictionary to store PDF filenames and their FAISS indexes
-uploaded_pdfs = {}
+# Load previously uploaded PDFs
+if os.path.exists(PDF_INDEX_FILE):
+    with open(PDF_INDEX_FILE, "r", encoding="utf-8") as f:
+        uploaded_pdfs = json.load(f)
+else:
+    uploaded_pdfs = {}
+
+def save_uploaded_pdfs():
+    """Save uploaded PDF information to a JSON file."""
+    with open(PDF_INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(uploaded_pdfs, f, indent=4)
 
 def process_pdfs(files):
     """Processes multiple uploaded PDFs and stores them in FAISS."""
@@ -33,6 +44,10 @@ def process_pdfs(files):
             file_path = file.name
             file_name = os.path.basename(file_path)
             faiss_index_path = os.path.join(FAISS_INDEX_DIR, file_name.replace(".pdf", ""))
+
+            # Skip if already processed
+            if file_name in uploaded_pdfs:
+                continue
 
             loader = PyMuPDFLoader(file_path)
             documents = loader.load()
@@ -50,8 +65,10 @@ def process_pdfs(files):
         except Exception as e:
             return f"⚠️ Error processing {file_name}: {str(e)}", list(uploaded_pdfs.keys())
 
-    return f"✅ Processed PDFs: {', '.join(processed_files)}", list(uploaded_pdfs.keys())  # Returns updated PDF list
+    # Save updated file list
+    save_uploaded_pdfs()
 
+    return f"✅ Processed PDFs: {', '.join(processed_files)}", list(uploaded_pdfs.keys())  # Returns updated PDF list
 
 def load_faiss_for_pdf(selected_pdf):
     """Loads the FAISS index for the selected PDF."""
@@ -60,111 +77,114 @@ def load_faiss_for_pdf(selected_pdf):
         return FAISS.load_local(uploaded_pdfs[selected_pdf], embeddings, allow_dangerous_deserialization=True)
     return None
 
+def delete_selected_pdf(selected_pdf):
+    """Deletes a selected PDF and its FAISS index."""
+    global uploaded_pdfs
 
-def chat_with_selected_pdf(message, history, selected_pdf):
-    """Handles chatbot interactions based on the selected PDF."""
+    if selected_pdf in uploaded_pdfs:
+        index_path = uploaded_pdfs[selected_pdf]
+        del uploaded_pdfs[selected_pdf]
+        save_uploaded_pdfs()
+
+        # Delete FAISS index directory
+        if os.path.exists(index_path):
+            os.system(f"rm -rf {index_path}")
+
+        return f"🗑️ Deleted {selected_pdf}", list(uploaded_pdfs.keys())
+    
+    return "⚠️ No such file found!", list(uploaded_pdfs.keys())
+
+def chat_with_selected_pdf(message, history, selected_pdf, chat_k):
+    """Handles chatbot interactions with dynamic `k`."""
     try:
-        # Ensure selected_pdf is a string (if it's a list, take the first item)
-        if isinstance(selected_pdf, list) and len(selected_pdf) > 0:
-            selected_pdf = selected_pdf[0]
-        
-        # Validate selected PDF
         if not selected_pdf or selected_pdf not in uploaded_pdfs:
-            return [(message, "⚠️ Please select a valid PDF before asking questions!")]
+            return history + [(message, "⚠️ Please select a valid PDF first.")]
 
         vector_store = load_faiss_for_pdf(selected_pdf)
-
         if vector_store is None:
-            return [(message, "⚠️ No FAISS index found for the selected PDF! Process it first.")]
+            return history + [(message, "⚠️ No FAISS index found. Process the PDF first.")]
 
-        retriever = vector_store.as_retriever(search_kwargs={"k": 8})
-        llm = ChatOpenAI(model="gpt-4")
+        retriever = vector_store.as_retriever(search_kwargs={"k": chat_k})  # Dynamic `k`
+
+        llm = ChatOpenAI(model="gpt-4-turbo", streaming=True)
 
         rag_chain = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=retriever,
-            chain_type="map_reduce",
-            return_source_documents=False,
-            output_key="result"
+            chain_type="stuff",
+            return_source_documents=False
         )
 
         response = rag_chain.run(message)
-        history.append((message, response))
+
+        history.append((message, response))  # ✅ FIXED: Ensured correct tuple format
         return history
     except Exception as e:
-        return [(message, f"⚠️ Error: {str(e)}")]
+        return history + [(message, f"⚠️ Error: {str(e)}")]
 
 
-def summarize_selected_pdf(selected_pdf):
+def summarize_selected_pdf(selected_pdf, summary_k):
     """Generates a summary for the selected PDF."""
-    if isinstance(selected_pdf, list) and len(selected_pdf) > 0:
-        selected_pdf = selected_pdf[0]
+    if not selected_pdf or selected_pdf not in uploaded_pdfs:
+        return "⚠️ No FAISS index found for the selected PDF! Process it first."
 
     vector_store = load_faiss_for_pdf(selected_pdf)
     if vector_store is None:
         return "⚠️ No FAISS index found for the selected PDF! Process it first."
 
-    retriever = vector_store.as_retriever(search_kwargs={"k": 8})
+    retriever = vector_store.as_retriever(search_kwargs={"k": summary_k})
     llm = ChatOpenAI(model="gpt-4")
 
-    summarize_chain = load_summarize_chain(llm, chain_type="map_reduce")
+    summarize_chain = load_summarize_chain(llm, chain_type="stuff")
     summary = summarize_chain.run(retriever.get_relevant_documents("Summarize this document"))
 
     return summary
 
-
-def export_chat(history):
-    """Exports chat history as a text file."""
-    chat_text = "\n".join([f"User: {q}\nAI: {a}\n" for q, a in history])
-    with open("chat_history.txt", "w", encoding="utf-8") as f:
-        f.write(chat_text)
-    return "chat_history.txt"
-
-
-# Custom Theme
-custom_theme = gr.themes.Soft(
-    primary_hue="amber",
-    secondary_hue="slate",
-    neutral_hue="zinc",
-    font=["Arial", "sans-serif"]
-)
-
+custom_css = """
+body, .gradio-container {
+    background: linear-gradient(to right, #FFDEAD, #F4A460) !important;
+    color: black !important;
+}
+"""
 
 # Gradio Interface
-with gr.Blocks(theme=custom_theme) as demo:
+with gr.Blocks(css=custom_css) as demo:
     gr.Markdown("# 📄 Multi-PDF Q&A Chatbot & Summary Generator")
 
     with gr.Row():
         file_input = gr.Files(label="📂 Upload PDFs")
         process_button = gr.Button("🚀 Process PDFs", scale=2)
+
     
     status_output = gr.Textbox(label="📢 Status", interactive=False, lines=2)
 
-    # Dropdown for selecting PDFs
-    pdf_selector = gr.Dropdown(label="📄 Select PDF", choices=[], interactive=True)
+    pdf_selector = gr.Dropdown(label="📄 Select PDF", choices=list(uploaded_pdfs.keys()), interactive=True)
+    delete_button = gr.Button("🗑️ Delete Selected PDF")
 
-    # Process PDFs & Update Dropdown
     def process_and_update(files):
         status_message, pdf_list = process_pdfs(files)
         return status_message, gr.update(choices=pdf_list)
 
+    def delete_and_update(selected_pdf):
+        status_message, pdf_list = delete_selected_pdf(selected_pdf)
+        return status_message, gr.update(choices=pdf_list, value="")
+
     process_button.click(process_and_update, inputs=file_input, outputs=[status_output, pdf_selector])
+    delete_button.click(delete_and_update, inputs=pdf_selector, outputs=[status_output, pdf_selector])
 
-    with gr.Row():
-        chatbot = gr.Chatbot(label="🤖 Chatbot (Ask about selected PDF)", height=400)
-    msg = gr.Textbox(label="💬 Enter your question", scale=3)
-    submit_button = gr.Button("▶️ Send", scale=1)
-    clear_button = gr.Button("🗑️ Clear Chat", scale=1)
+    # Chatbot UI
+    chatbot = gr.Chatbot(label="🤖 Chatbot (Ask about selected PDF)", height=400)
+    msg = gr.Textbox(label="💬 Enter your question")
 
-    submit_button.click(chat_with_selected_pdf, inputs=[msg, chatbot, pdf_selector], outputs=chatbot)
-    clear_button.click(lambda: [], None, chatbot)
+    # Chat Settings
+    chat_k_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="🤖 Chatbot: Number of Retrieved Documents (k)")
+    submit_button = gr.Button("▶️ Send")
+    submit_button.click(chat_with_selected_pdf, inputs=[msg, chatbot, pdf_selector, chat_k_slider], outputs=chatbot)
 
-    with gr.Row():
-        summary_button = gr.Button("📜 Generate Summary")
-        summary_output = gr.Textbox(label="📄 Summary")
-        summary_button.click(summarize_selected_pdf, inputs=pdf_selector, outputs=summary_output)
-
-    download_button = gr.Button("💾 Download Chat History")
-    download_button.click(export_chat, inputs=chatbot, outputs=gr.File(label="📥 Download"))
+    # Summary Settings
+    summary_k_slider = gr.Slider(minimum=1, maximum=10, value=5, step=1, label="📜 Summary: Number of Retrieved Documents (k)")
+    summary_button = gr.Button("📜 Generate Summary")
+    summary_output = gr.Textbox(label="📄 Summary")
+    summary_button.click(summarize_selected_pdf, inputs=[pdf_selector, summary_k_slider], outputs=summary_output)
 
 demo.launch()
